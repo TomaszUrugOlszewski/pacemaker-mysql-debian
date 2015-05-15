@@ -1,0 +1,353 @@
+#!/bin/bash
+
+#
+# http://www.linux-ha.org/doc/dev-guides/ra-dev-guide.html
+#
+
+: ${OCF_FUNCTIONS_DIR=${OCF_ROOT}/lib/heartbeat}
+. ${OCF_FUNCTIONS_DIR}/ocf-shellfuncs
+
+
+meta_data() {
+  cat <<END
+<?xml version="1.0"?>
+<!DOCTYPE resource-agent SYSTEM "ra-api-1.dtd">
+<resource-agent name="mysql-debian">
+<version>1.0</version>
+
+<longdesc lang="en">
+MySQL High Availability
+</longdesc>
+<shortdesc lang="en">MySQL High Availability</shortdesc>
+
+<parameters>
+
+<parameter name="server_id" unique="1" required="1">
+<longdesc lang="en">
+Unique server-id value used by MySQL on node that you'll
+run this resource.
+</longdesc>
+<shortdesc lang="en">server-id</shortdesc>
+<content type="string" default="" />
+</parameter>
+
+<parameter name="monitoruser_login" unique="0" required="1">
+<longdesc lang="en">
+MySQL monitoring user login
+</longdesc>
+<shortdesc lang="en">Monitoring user login</shortdesc>
+<content type="string" default="" />
+</parameter>
+
+<parameter name="monitoruser_pass" unique="0" required="1">
+<longdesc lang="en">
+MySQL monitoring user password
+</longdesc>
+<shortdesc lang="en">Monitoring user password</shortdesc>
+<content type="string" default="" />
+</parameter>
+
+</parameters>
+
+<actions>
+<action name="start"        timeout="60" />
+<action name="stop"         timeout="900" />
+<action name="monitor"      timeout="30" interval="10" depth="0" />
+<action name="meta-data"    timeout="5" />
+<action name="validate-all" timeout="10" />
+</actions>
+</resource-agent>
+END
+}
+
+
+#
+# Log error
+#
+error() {
+    ocf_log err "[${OCF_RESOURCE_INSTANCE}] $@"
+}
+
+
+#
+# Log debug
+#
+debug() {
+    ocf_log debug "[${OCF_RESOURCE_INSTANCE}] $@"
+}
+
+
+#
+# Get server-id from /etc/mysql/my.cnf
+# Save output to CONF_ID variable
+#
+get_local_mysql_id() {
+  CNF=/etc/mysql/my.cnf
+
+  CONF_ID=$(awk '/^server-id/{ print $3 }' "$CNF" 2>&1)
+  if (( $? != 0 )) || [[ -z "$CONF_ID" ]]; then
+    error "Cannot find server-id value in $CNF"
+    return 1
+  fi
+
+  return 0
+}
+
+
+#
+# Help with agent usage
+#
+usage() 
+{
+  cat <<EOF
+Usage: $0 [action]
+
+ Actions:
+   start         : start a new mysql instance
+   stop          : stop the running mysql instance
+   monitor       : return TRUE if the mysql appears to be working.
+   meta-data     : show meta data message
+   validate-all  : validate the instance parameters
+
+EOF
+
+  return $OCF_ERR_UNIMPLEMENTED
+}
+
+
+#
+# Test if MySQL is turned on.
+# Check if MySQL PID exists, and MySQL is running on it
+# Returns:
+# - 0   : running
+# - 1   : nope
+#
+mysql_is_on() {
+  PID_FILE="/var/run/mysqld/mysqld.pid"
+  local mysql_pid
+  local mysql_comm
+
+  mysql_pid=$(cat "$PID_FILE" 2> /dev/null)
+  if (( $? == 0 )) && [[ -n "$mysql_pid" ]]; then
+    mysql_comm=$(ps -p "$mysql_pid" -o comm h)
+    if (( $? != 0 )); then
+      error "PID $mysql_pid from $PID_FILE is unused"
+      return 1
+    fi
+
+    if [[ "$mysql_comm" != "mysqld" ]]; then
+      error "PID $mysql_pid from $PID_FILE is not used by MySQL"
+      return 1
+    fi
+
+    # Ok, MySQL was turned of
+    return 0
+  fi
+
+  error "MySQL is not running, no pid file $PID_FILE"
+  return 1
+}
+
+
+#
+# Test if MySQL is running by making connection
+# Returns:
+# - 0   : MySQL is running
+# - 1   : MySQL is down
+#
+mysql_is_running() {
+  HOST="$(hostname)"
+  MONITOR_LOGIN=$OCF_RESKEY_monitoruser_login
+  MONITOR_PASS=$OCF_RESKEY_monitoruser_pass
+  OPTS="-u $MONITOR_LOGIN --password=$MONITOR_PASS -h $HOST"
+
+  local out
+
+  out=$(/usr/bin/mysqladmin --defaults-file=/etc/mysql/debian.cnf --connect-timeout=5 status 2>&1)
+  if (( $? != 0 )); then
+    error "mysqladmin status error ($out)"
+    return 1
+  fi
+
+  out=$(mysql $OPTS --connect_timeout=5 -e 'SHOW GRANTS' 2>&1)
+  if (( $? != 0 )); then
+    error "can't connect to MySQL on $HOST with user $MONITOR_LOGIN ($out)"
+    return 1
+  fi
+
+  return 0
+}
+
+
+#
+# Monitor MySQL status
+# http://www.linux-ha.org/doc/dev-guides/_literal_monitor_literal_action.html
+#
+mysql_monitor()
+{
+  mysql_validate_all
+
+  # If it's different server-id, then probably this resource is not running on
+  # this node
+  if (( $CONF_ID != $OCF_RESKEY_server_id )); then
+    debug "ignoring resource with invalid server-id=$CONF_ID"
+    return $OCF_NOT_RUNNING
+  fi
+
+  debug "checking status of MySQL resource"
+
+  local retry_no=0
+  local retry_wait=3
+
+  # Check if MySQL is running for few times, because pacemaker will stop resource
+  # if it's not. This way we can protect from temporary spikes of load etc.
+  while (( $retry_no < 4 )); do
+    mysql_is_running
+    if (( $? == 0 )); then
+      debug "resource is okay"
+      return $OCF_SUCCESS
+    fi
+
+    # If there is no PID file, then we can immediately return $OCF_NOT_RUNNING
+    # because MySQL is stopped nearly for sure.
+    mysql_is_on || break
+
+    ((retry_no+=1))
+    error "waiting ${retry_wait}s to retry monitor action (retry=${retry_no})"
+    sleep ${retry_wait}s
+  done
+
+  debug "resource is not running"
+  return $OCF_NOT_RUNNING
+}
+
+
+#
+# Start MySQL
+# http://www.linux-ha.org/doc/dev-guides/_resource_agent_actions.html#_literal_start_literal_action
+#
+mysql_start()
+{
+  mysql_validate_all
+
+  # Try to run resouce on different node when server-id is invalid on this one.
+  # ERR_INSTALLED allows pacemaker to find proper node for this resource
+  # It shouldn't be run in mysql_validate_all, because pacemaker run e.g.
+  # monitor on all nodes, to check if resource is running.
+  if (( $CONF_ID != $OCF_RESKEY_server_id )); then
+    error "resource can't be run on this node ($(hostname)), invalid server-id=$CONF_ID"
+    exit $OCF_ERR_INSTALLED
+  fi
+
+  mysql_monitor
+  if (( $? == $OCF_SUCCESS )); then
+    debug "resource is already running"
+    return $OCF_SUCCESS
+  fi
+
+  debug "Starting MySQL"
+  /etc/init.d/mysql start
+  (( $? != $OCF_SUCCESS )) && return $OCF_ERR_GENERIC
+
+  while true; do
+    mysql_monitor
+    (( $? == $OCF_SUCCESS )) && return $OCF_SUCCESS
+
+    debug "still waiting for mysql start"
+    sleep 1
+  done
+}
+
+
+#
+# Stop MySQL
+# http://www.linux-ha.org/doc/dev-guides/_literal_stop_literal_action.html
+#
+mysql_stop()
+{
+  mysql_validate_all
+
+  # If it's different server-id, then probably this resource is not running on
+  # this node
+  if (( $CONF_ID != $OCF_RESKEY_server_id )); then
+    debug "ignoring resource with invalid server-id=$CONF_ID"
+    return $OCF_NOT_RUNNING
+  fi
+
+  # I'm not sure what to do here, if mysql stop returns an error.
+  # Where resource is in Stopped state then VIP is not switched
+
+  debug "stopping MySQL"
+  /etc/init.d/mysql stop
+  if (( $? != 0 )); then
+    error "can't stop MySQL with init script"
+    mysqladmin --defaults-file=/etc/mysql/debian.cnf shutdown
+    if (( $? != 0 )); then
+      error "can't stop MySQL with mysqladmin"
+    fi
+  fi
+
+  while true; do
+    mysql_monitor
+    (( $? == $OCF_NOT_RUNNING )) && return $OCF_SUCCESS
+
+    debug "still waiting for mysql stop"
+    sleep 1
+  done
+}
+
+
+#
+# Validate MySQL resource configuration
+# http://www.linux-ha.org/doc/dev-guides/_literal_validate_all_literal_action.html
+#
+mysql_validate_all()
+{
+  if [[ -z "$OCF_RESKEY_monitoruser_login" || -z "$OCF_RESKEY_monitoruser_pass" ]]; then
+    error "parameters monitor login/pass not specified"
+    exit $OCF_ERR_CONFIGURED
+  fi
+
+  if [[ -z "$OCF_RESKEY_server_id" ]]; then
+    error "parameter server_id not specified"
+    exit $OCF_ERR_CONFIGURED
+  fi
+
+  get_local_mysql_id
+  (( $? != 0 )) && exit $OCF_ERR_CONFIGURED
+
+  return $OCF_SUCCESS
+}
+
+
+debug "action: $__OCF_ACTION"
+
+case "$__OCF_ACTION" in
+  'meta-data')
+    meta_data
+    ;;
+  'start')
+    mysql_start
+    exit $?
+    ;;
+  'stop')
+    mysql_stop
+    exit $?
+    ;;
+  'monitor')
+    mysql_monitor
+    exit $?
+    ;;
+  'validate-all')
+    mysql_validate_all
+    exit $?
+    ;;
+  'help')
+    usage
+    exit $?
+    ;;
+  *)
+    echo "Unknown action $__OCF_ACTION. Try help"
+    exit $OCF_ERR_UNIMPLEMENTED
+    ;;
+esac
